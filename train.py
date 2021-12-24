@@ -1,5 +1,6 @@
 import os
-import cv2
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+
 import numpy as np
 import matplotlib.pyplot as plt
 import albumentations as albu
@@ -8,14 +9,17 @@ import torch
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
 
+import wandb
+
 import utils
 from dataset import SYNTHIADataset
 
-# Parameter
+# Init wandb logs for training history
+wandb.init(project="SYNTHIA-SF-SEGM")
+
+# Dataset path
 TRAIN_DATA_DIR = './dataset/SYNTHIA-SF/SEQ1/'
 VAL_DATA_DIR = './dataset/SYNTHIA-SF/SEQ2/'
-TEST_DATA_DIR = './dataset/SYNTHIA-SF/SEQ3/'
-
 
 # Define the Dataset Folder
 x_train_dir = os.path.join(TRAIN_DATA_DIR, 'RGBLeft')
@@ -24,40 +28,25 @@ y_train_dir = os.path.join(TRAIN_DATA_DIR, 'GTLeft')
 x_valid_dir = os.path.join(VAL_DATA_DIR, 'RGBLeft')
 y_valid_dir = os.path.join(VAL_DATA_DIR, 'GTLeft')
 
-x_test_dir = os.path.join(TEST_DATA_DIR, 'RGBLeft')
-y_test_dir = os.path.join(TEST_DATA_DIR, 'GTLeft')
-
-# Augmentation Parameter
+# Augmentation Parameter for Training
 input_width = 640
 input_height = 640
 
 # Model Parameter
 ENCODER = 'resnet50'
 ENCODER_WEIGHTS = 'imagenet'
+ACTIVATION = 'softmax'
+DEVICE = 'cuda'
+LR = 1e-4
+BS = 8
 
+# Segmentation Classes
 CLASSES = ['void', 'road', 'sidewalk', 'building', 'wall', 'fence', 'pole', 'traffic_light', 'traffic_sign',
             'vegetation', 'terrain', 'sky', 'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle',
             'road_lines', 'other', 'road_works']
 
-# CLASSES = ['car']
-
-ACTIVATION = 'softmax'
-DEVICE = 'cuda'
-
-# Testing
-# trainDataset = SYNTHIADataset(images_dir=x_train_dir,
-#                                 masks_dir=y_train_dir,
-#                                 classes=['car'])
-
-# image, mask = trainDataset[1]
-
-# utils.visualize(
-#     image=image, 
-#     cars_mask=mask.squeeze(),
-# )
-
-# Augmentations
-trainAug = albu.Compose([
+# Train Augmentations Pipeline
+train_aug_pipeline = albu.Compose([
     albu.HorizontalFlip(p=0.5),
     albu.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=1, border_mode=0),
     albu.PadIfNeeded(min_height=input_width, min_width=input_height, always_apply=True, border_mode=0),
@@ -83,20 +72,10 @@ trainAug = albu.Compose([
     ),
 ])
 
-valAug = albu.Compose([albu.PadIfNeeded(1088, 1920)])
+# Validation Augmentations Pipeline
+val_aug_pipeline = albu.Compose([albu.PadIfNeeded(1088, 1920)])
 
-# augmented_dataset = SYNTHIADataset(
-#     images_dir=x_train_dir, 
-#     masks_dir=y_train_dir, 
-#     augmentation=trainAug, 
-#     classes=['car'],
-# )
-
-# for i in range(3):
-#     image, mask = augmented_dataset[1]
-#     utils.visualize(image=image, mask=mask.squeeze(-1))
-
-# create segmentation model with pretrained encoder
+# Create the segmentation model with pretrained encoder
 model = smp.DeepLabV3Plus(
     encoder_name=ENCODER, 
     encoder_weights=ENCODER_WEIGHTS, 
@@ -104,38 +83,46 @@ model = smp.DeepLabV3Plus(
     activation=ACTIVATION,
 )
 
+# Get the preprocessing function from the encoders
 preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
 
+# Train dataset object
 train_dataset = SYNTHIADataset(
     images_dir=x_train_dir, 
     masks_dir=y_train_dir, 
-    augmentation=trainAug, 
+    augmentation=train_aug_pipeline, 
     preprocessing=utils.get_preprocessing(preprocessing_fn),
     classes=CLASSES,
 )
 
+# Validation dataset object
 valid_dataset = SYNTHIADataset(
-    images_dir=x_train_dir, 
-    masks_dir=y_train_dir, 
-    augmentation=valAug, 
+    images_dir=x_valid_dir, 
+    masks_dir=y_valid_dir, 
+    augmentation=val_aug_pipeline, 
     preprocessing=utils.get_preprocessing(preprocessing_fn),
     classes=CLASSES,
 )
 
-train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=2, drop_last=True)
+# Build the dataloader
+train_loader = DataLoader(train_dataset, batch_size=BS, shuffle=True, num_workers=1, drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=True)
 
+# Loss function that we used
 loss = smp.utils.losses.DiceLoss()
 
+# Metrics for performance
 metrics = [
     smp.utils.metrics.IoU(threshold=0.5),
 ]
 
+# Optimizer
 optimizer = torch.optim.Adam([ 
-    dict(params=model.parameters(), lr=0.0001),
+    dict(params=model.parameters(), lr=LR),
 ])
 
-train_epoch = smp.utils.train.TrainEpoch(
+# Trainer object
+trainer = smp.utils.train.TrainEpoch(
     model, 
     loss=loss, 
     metrics=metrics, 
@@ -144,7 +131,8 @@ train_epoch = smp.utils.train.TrainEpoch(
     verbose=True,
 )
 
-valid_epoch = smp.utils.train.ValidEpoch(
+# Validator object
+validator = smp.utils.train.ValidEpoch(
     model, 
     loss=loss, 
     metrics=metrics, 
@@ -152,20 +140,32 @@ valid_epoch = smp.utils.train.ValidEpoch(
     verbose=True,
 )
 
+# Maximum score for keeping records
 max_score = 0
 
+# Training loop
 for i in range(0, 40):
-    
+
     print('\nEpoch: {}'.format(i))
-    train_logs = train_epoch.run(train_loader)
-    valid_logs = valid_epoch.run(valid_loader)
-    
-    # do something (save model, change lr, etc.)
+
+    # Train and validation
+    train_logs = trainer.run(train_loader)
+    valid_logs = validator.run(valid_loader)
+
+    print("train:", train_logs)
+    print("valid:", valid_logs)
+
+    # Logs the loss and the iou score
+    wandb.log({'train/dice_loss': train_logs['dice_loss'], 'train/iou_score': train_logs['iou_score']})
+    wandb.log({'val/dice_loss': valid_logs['dice_loss'], 'val/iou_score': valid_logs['iou_score']})
+
+    # If the validation score is higher than the max score > save the model
     if max_score < valid_logs['iou_score']:
         max_score = valid_logs['iou_score']
-        torch.save(model, './best_model.pth')
+        torch.save(model, './output/best_model.pth')
         print('Model saved!')
-        
+    
+    # Reduce the learning rate on Epoch 25 to 0.00001
     if i == 25:
         optimizer.param_groups[0]['lr'] = 1e-5
         print('Decrease decoder learning rate to 1e-5!')
